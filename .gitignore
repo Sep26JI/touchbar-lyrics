@@ -1,0 +1,11 @@
+# Local builds, caches, backups and visual test artifacts
+.DS_Store
+/dist/
+/backups/
+*.png
+*.zip
+__pycache__/
+*.py[cod]
+/Tests/clock-tests
+/Tests/lyric-effects-tests
+/Tests/live-*/
