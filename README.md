@@ -1,6 +1,6 @@
 # Touch Bar Lyrics · QQ 音乐常驻歌词
 
-独立 macOS 菜单栏应用，让 QQ 音乐在后台播放时仍能在 Touch Bar 上显示歌词，无需 BetterTouchTool。当前版本 **4.4**，在 **M1 MacBook Pro A2338 / macOS 27.0.1** 上开发与验证。
+独立 macOS 菜单栏应用，让 QQ 音乐在后台播放时仍能在 Touch Bar 上显示歌词。当前版本 **4.4**，在 **M1 MacBook Pro A2338 / macOS 27.0.1** 上开发与验证。
 
 ## 功能
 
