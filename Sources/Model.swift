@@ -1,25 +1,60 @@
 import Cocoa
 
-struct LyricRow: Decodable { let time: Double; let text: String }
+struct LyricWord: Decodable {
+    let time: Double
+    let duration: Double
+    let text: String
+}
+struct LyricRow: Decodable {
+    let time: Double
+    let text: String
+    var words: [LyricWord]? = nil
+    var end: Double? = nil
+}
+struct WordHighlight {
+    let range: NSRange
+    let progress: Double
+}
+enum WordTiming {
+    static func isValid(text: String, words: [LyricWord]) -> Bool {
+        !words.isEmpty && words.map({ $0.text }).joined() == text &&
+        words.allSatisfy({ $0.time.isFinite && $0.duration.isFinite && $0.duration >= 0 })
+    }
+    static func highlights(text: String, words: [LyricWord], time: Double) -> [WordHighlight] {
+        guard isValid(text:text,words:words) else { return [] }
+        var offset=0
+        return words.map { word in
+            let count=(word.text as NSString).length
+            let progress=word.duration > 0 ? min(1,max(0,(time-word.time)/word.duration)) : (time >= word.time ? 1.0:0.0)
+            defer { offset += count }
+            return WordHighlight(range:NSRange(location:offset,length:count),progress:progress)
+        }
+    }
+}
 struct LyricResult: Decodable { let key: String; let source: String; let entries: [LyricRow] }
 struct LyricFrame {
     var id: String
     var text: String
     var next: String = ""
     var progress: Double? = nil
+    var highlights: [WordHighlight] = []
 }
 enum LyricTimeline {
-    static func frame(rows:[LyricRow],time:Double,duration:Double,identity:String,fallback:String,maxFillDuration:Double = 8) -> LyricFrame {
+    static func frame(rows:[LyricRow],time:Double,duration:Double,identity:String,fallback:String,maxFillDuration:Double = 8,estimateProgress:Bool = true) -> LyricFrame {
         func hasText(_ row:LyricRow) -> Bool { !row.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty }
         // Empty timed entries mark instrumental gaps. Keep the last real lyric
         // and its identity so gaps neither show the title nor trigger a slide.
         let index=rows.lastIndex(where: { $0.time <= time && hasText($0) })
         guard let i=index else {
-            return LyricFrame(id:identity+"/intro",text:fallback,next:rows.first(where:hasText)?.text ?? "")
+            return LyricFrame(id:identity+"/intro",text:fallback,next:fallback.isEmpty ? "" : rows.first(where:hasText)?.text ?? "")
         }
         let row=rows[i]
         let following=rows.dropFirst(i+1)
         let next=following.first(where:hasText)?.text ?? ""
+        let highlights=WordTiming.highlights(text:row.text,words:row.words ?? [],time:time)
+        if !highlights.isEmpty {
+            return LyricFrame(id:identity+"/\(i)",text:row.text,next:next,highlights:highlights)
+        }
         // A blank still ends the sung line: finish its tint at the gap, then
         // hold the completed tint rather than stretching it across the silence.
         let boundary=following.first(where: { $0.time > row.time })?.time ?? duration
@@ -27,7 +62,7 @@ enum LyricTimeline {
         // gap. Bound the visual estimate; do not include an entire long silence.
         let limit=maxFillDuration.isFinite ? min(15,max(2,maxFillDuration)):8
         let end=min(boundary,row.time+limit)
-        let progress = end>row.time ? min(1,max(0,(time-row.time)/(end-row.time))) : nil
+        let progress = estimateProgress && end>row.time ? min(1,max(0,(time-row.time)/(end-row.time))) : nil
         return LyricFrame(id:identity+"/\(i)",text:row.text,next:next,progress:progress)
     }
 }
@@ -38,6 +73,7 @@ struct Playback: Decodable {
     var elapsedTimeMicros: Double?; var timestampEpochMicros: Double?
     var elapsedTimeNowMicros: Double?; var playbackRate: Double?; var playing: Bool?
     var duration: Double { (durationMicros ?? 0) / 1_000_000 }
+    var paused: Bool { playing == false || playbackRate == 0 }
     var identity: String { [bundleIdentifier ?? "", title ?? "", artist ?? "", album ?? ""].joined(separator: "\u{1f}") }
     func position(at date: Date = Date()) -> Double {
         let anchor = (elapsedTimeMicros ?? 0) / 1_000_000
@@ -45,6 +81,32 @@ struct Playback: Decodable {
         let delta = timestampEpochMicros.map { date.timeIntervalSince1970 - $0 / 1_000_000 } ?? 0
         let value = anchor + max(0, delta) * rate
         return max(0, duration > 0 ? min(duration, value) : value)
+    }
+}
+
+struct PauseDisplayState {
+    private var identity: String?
+    private var began: Date?
+    mutating func update(_ playback: Playback, at date: Date = Date()) {
+        if playback.paused {
+            if identity != playback.identity || began == nil { began = date }
+        } else { began = nil }
+        identity = playback.identity
+    }
+    func showsTitle(for playback: Playback, at date: Date = Date()) -> Bool {
+        // Media sessions can briefly report paused while changing songs.
+        playback.paused && identity == playback.identity && began.map { date.timeIntervalSince($0) >= 1.2 } == true
+    }
+}
+
+enum LyricPresentation {
+    static func frame(playback: Playback, rows: [LyricRow], time: Double, showPausedTitle: Bool, maxFillDuration: Double, estimateProgress: Bool = false) -> LyricFrame {
+        if playback.paused && showPausedTitle {
+            let caption = [playback.title, playback.artist].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            return LyricFrame(id:playback.identity+"/paused",text:caption)
+        }
+        return LyricTimeline.frame(rows:rows,time:time,duration:playback.duration,
+                                   identity:playback.identity,fallback:"",maxFillDuration:maxFillDuration,estimateProgress:estimateProgress)
     }
 }
 
@@ -71,15 +133,17 @@ struct PlaybackClock {
 
 final class Preferences {
     let defaults = UserDefaults.standard
-    init() { defaults.register(defaults: ["style":0,"font":"System","fontSize":17.0,"color":"#FFFFFF","accent":"#47DBC0","lead":1.7,"desktop":false,"controls":true,"scroll":true,"lineProgress":true,"slideLyrics":true,"horizontalOffset":-24.0,"maxFillDuration":8.0]) }
+    init() { defaults.register(defaults: ["style":0,"font":"System","fontSize":17.0,"color":"#FFFFFF","accent":"#47DBC0","lead":1.7,"wordLead":0.0,"desktop":false,"controls":true,"scroll":true,"lineProgress":true,"slideLyrics":true,"horizontalOffset":-24.0,"maxFillDuration":8.0,"estimateProgress":false]) }
     var style: Int { get { defaults.integer(forKey:"style") } set { defaults.set(newValue,forKey:"style") } }
     var fontName: String { get { defaults.string(forKey:"font") ?? "System" } set { defaults.set(newValue,forKey:"font") } }
     var fontSize: Double { get { defaults.double(forKey:"fontSize") } set { defaults.set(newValue,forKey:"fontSize") } }
     var lead: Double { get { defaults.double(forKey:"lead") } set { defaults.set(newValue,forKey:"lead") } }
+    var wordLead: Double { get { defaults.double(forKey:"wordLead") } set { defaults.set(newValue,forKey:"wordLead") } }
     var desktop: Bool { get { defaults.bool(forKey:"desktop") } set { defaults.set(newValue,forKey:"desktop") } }
     var controls: Bool { get { defaults.bool(forKey:"controls") } set { defaults.set(newValue,forKey:"controls") } }
     var scroll: Bool { get { defaults.bool(forKey:"scroll") } set { defaults.set(newValue,forKey:"scroll") } }
     var lineProgress: Bool { get { defaults.bool(forKey:"lineProgress") } set { defaults.set(newValue,forKey:"lineProgress") } }
+    var estimateProgress: Bool { get { defaults.bool(forKey:"estimateProgress") } set { defaults.set(newValue,forKey:"estimateProgress") } }
     var slideLyrics: Bool { get { defaults.bool(forKey:"slideLyrics") } set { defaults.set(newValue,forKey:"slideLyrics") } }
     var maxFillDuration: Double {
         get { min(15,max(2,defaults.double(forKey:"maxFillDuration"))) }
@@ -110,7 +174,11 @@ final class PlayerModel {
     let prefs: Preferences
     var playback: Playback?
     var clock = PlaybackClock()
-    var rows: [LyricRow] = []
+    var pauseDisplay = PauseDisplayState()
+    var rows: [LyricRow] = [] {
+        didSet { hasWordTiming=rows.contains { WordTiming.isValid(text:$0.text,words:$0.words ?? []) } }
+    }
+    private(set) var hasWordTiming = false
     var source = "等待 QQ 音乐播放"
     var lyricKey = ""
     var receivedAt = Date.distantPast
@@ -128,11 +196,15 @@ final class PlayerModel {
     var isQQ: Bool { playback?.bundleIdentifier == "com.tencent.QQMusicMac" }
     var fresh: Bool { Date().timeIntervalSince(receivedAt) < 5 }
     var position: Double { fresh ? clock.position() : 0 }
+    var lead: Double { hasWordTiming ? prefs.wordLead:prefs.lead }
+    var timingStatus: String {
+        guard !rows.isEmpty else { return "" }
+        return hasWordTiming ? "逐字时间" : (prefs.estimateProgress ? "逐句时间 · 染色为估算" : "逐句时间 · 暂无逐字染色")
+    }
     var lyricFrame: LyricFrame {
-        guard isQQ, fresh else { return LyricFrame(id:"status",text:isQQ ? "正在重新连接 QQ 音乐…" : "等待 QQ 音乐播放") }
-        guard !rows.isEmpty else { return LyricFrame(id:playback!.identity+"/loading",text:playback?.title ?? "QQ 音乐",next:source) }
-        return LyricTimeline.frame(rows:rows,time:position+prefs.lead,duration:playback?.duration ?? 0,
-                                   identity:playback!.identity,fallback:"♪ " + (playback?.title ?? "间奏"),maxFillDuration:prefs.maxFillDuration)
+        guard isQQ, fresh, let playback=playback else { return LyricFrame(id:"status",text:"") }
+        return LyricPresentation.frame(playback:playback,rows:rows,time:position+lead,
+                                       showPausedTitle:pauseDisplay.showsTitle(for:playback),maxFillDuration:prefs.maxFillDuration,estimateProgress:prefs.estimateProgress)
     }
     var current: (String,String) { (lyricFrame.text,lyricFrame.next) }
     func start() {
@@ -162,7 +234,7 @@ final class PlayerModel {
                     return
                 }
                 let different = self.playback?.identity != value.identity
-                self.clock.update(value); self.playback=value; self.receivedAt=Date()
+                self.clock.update(value); self.pauseDisplay.update(value); self.playback=value; self.receivedAt=Date()
                 if different {
                     self.lookupToken=UUID(); if let process=self.lookupProcess, process.isRunning { process.terminate() }; self.rows=[]; self.lyricKey=""
                     self.source = self.isQQ ? "正在查找歌词…" : "请在 QQ 音乐播放歌曲"

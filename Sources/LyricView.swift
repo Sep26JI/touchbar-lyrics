@@ -1,4 +1,5 @@
 import Cocoa
+import CoreText
 
 final class LyricView: NSView {
     let model: PlayerModel
@@ -50,7 +51,9 @@ final class LyricView: NSView {
         let now=ProcessInfo.processInfo.systemUptime
         let frame=model.lyricFrame
         if visibleFrame?.id != frame.id || visibleFrame?.text != frame.text {
-            outgoing=prefs.slideLyrics ? visibleFrame:nil
+            // Pause captions are status, not a lyric to slide through on resume.
+            let pauseCaption=frame.id.hasSuffix("/paused") || visibleFrame?.id.hasSuffix("/paused") == true
+            outgoing=prefs.slideLyrics && !pauseCaption ? visibleFrame:nil
             outgoingBegan=lineBegan
             transitionBegan=now
             lineBegan=now
@@ -62,14 +65,14 @@ final class LyricView: NSView {
             if outgoing != nil { needsDisplay=true }
             outgoing=nil
         }
-        let state="\(frame.id)|\(frame.text)|\(frame.next)|\(Int(model.position))|\(model.playback?.playing ?? false)|\(model.fresh)|\(prefs.controls)|\(prefs.style)|\(prefs.fontName)|\(prefs.fontSize)|\(prefs.horizontalOffset)|\(prefs.lineProgress)|\(prefs.maxFillDuration)|\(prefs.slideLyrics)|\(prefs.scroll)|\(prefs.defaults.string(forKey:"color") ?? "")|\(prefs.defaults.string(forKey:"accent") ?? "")"
+        let state="\(frame.id)|\(frame.text)|\(frame.next)|\(Int(model.position))|\(model.playback?.playing ?? false)|\(model.fresh)|\(prefs.controls)|\(prefs.style)|\(prefs.fontName)|\(prefs.fontSize)|\(prefs.horizontalOffset)|\(prefs.lineProgress)|\(prefs.estimateProgress)|\(prefs.maxFillDuration)|\(prefs.slideLyrics)|\(prefs.scroll)|\(prefs.defaults.string(forKey:"color") ?? "")|\(prefs.defaults.string(forKey:"accent") ?? "")"
         if state != lastVisualState {
             lastVisualState=state
             for b in mediaButtons { b.isEnabled=model.isQQ && model.fresh }
             needsLayout=true; needsDisplay=true
         }
         let moving=model.playback?.playing != false && model.playback?.playbackRate != 0
-        if outgoing != nil || (prefs.lineProgress && moving && frame.progress != nil) { needsDisplay=true }
+        if outgoing != nil || (prefs.lineProgress && moving && (frame.progress != nil || !frame.highlights.isEmpty)) { needsDisplay=true }
         if prefs.scroll && (frame.text as NSString).size(withAttributes:[.font:prefs.font()]).width>lyricArea.width-20 { needsDisplay=true }
     }
     override func draw(_ dirtyRect:NSRect) {
@@ -117,14 +120,15 @@ final class LyricView: NSView {
     private func render(_ frame:LyricFrame,in inset:NSRect,began:Double) {
         let color=prefs.color("color")
         let progress=prefs.lineProgress ? frame.progress:nil
+        let highlights=prefs.lineProgress ? frame.highlights:[]
         if prefs.style == 2 && !frame.next.isEmpty {
-            drawLine(frame.text,in:NSRect(x:inset.minX,y:inset.midY-1,width:inset.width,height:inset.height/2+1),font:prefs.font(size:min(prefs.fontSize,15)),color:color,scroll:prefs.scroll,began:began,progress:progress)
+            drawLine(frame.text,in:NSRect(x:inset.minX,y:inset.midY-1,width:inset.width,height:inset.height/2+1),font:prefs.font(size:min(prefs.fontSize,15)),color:color,scroll:prefs.scroll,began:began,progress:progress,highlights:highlights)
             drawLine(frame.next,in:NSRect(x:inset.minX,y:inset.minY,width:inset.width,height:inset.height/2-1),font:prefs.font(size:10),color:color.withAlphaComponent(0.5),scroll:false,began:began,progress:nil)
         } else {
-            drawLine(frame.text,in:inset,font:prefs.font(),color:color,scroll:prefs.scroll,began:began,progress:progress)
+            drawLine(frame.text,in:inset,font:prefs.font(),color:color,scroll:prefs.scroll,began:began,progress:progress,highlights:highlights)
         }
     }
-    private func drawLine(_ text:String,in rect:NSRect,font:NSFont,color:NSColor,scroll:Bool,began:Double,progress:Double?) {
+    private func drawLine(_ text:String,in rect:NSRect,font:NSFont,color:NSColor,scroll:Bool,began:Double,progress:Double?,highlights:[WordHighlight] = []) {
         let attrs:[NSAttributedString.Key:Any]=[.font:font,.foregroundColor:color]
         var displayed=text
         // Measure the actual truncated string so centering and tint clips agree.
@@ -150,7 +154,30 @@ final class LyricView: NSView {
         }
         let point=NSPoint(x:x,y:rect.midY-size.height/2)
         string.draw(at:point)
-        if let progress=progress,progress>0 {
+        if !highlights.isEmpty {
+            // Use shaped glyph positions rather than character counts: an English
+            // word, emoji, and Chinese character occupy different pixel widths.
+            let line=CTLineCreateWithAttributedString(NSAttributedString(string:text,attributes:attrs))
+            let retained=(displayed.hasSuffix("…") && displayed != text) ? (displayed as NSString).length-1 : (displayed as NSString).length
+            let retainedX=CTLineGetOffsetForStringIndex(line,retained,nil)
+            let clips=NSBezierPath()
+            for item in highlights where item.progress>0 && item.range.location<retained {
+                let end=NSMaxRange(item.range)
+                let startX=CTLineGetOffsetForStringIndex(line,item.range.location,nil)
+                let endX=CTLineGetOffsetForStringIndex(line,end,nil)
+                let start=min(startX,endX)
+                let width=max(0,min(abs(endX-startX)*item.progress,retainedX-start))
+                if width>0 { clips.appendRect(NSRect(x:x+start,y:rect.minY,width:width,height:rect.height)) }
+            }
+            // AppKit leaves an empty path's clip unchanged. At a word's exact
+            // start, skip the overlay instead of accidentally tinting all text.
+            if !clips.isEmpty {
+                NSGraphicsContext.saveGraphicsState(); clips.addClip()
+                var highlighted=attrs; highlighted[.foregroundColor]=prefs.color("accent")
+                NSAttributedString(string:displayed,attributes:highlighted).draw(at:point)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        } else if let progress=progress,progress>0 {
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect:NSRect(x:x,y:rect.minY,width:size.width*min(1,progress),height:rect.height)).addClip()
             var highlighted=attrs; highlighted[.foregroundColor]=prefs.color("accent")

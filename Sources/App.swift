@@ -19,6 +19,7 @@ final class AppDelegate:NSObject,NSApplicationDelegate,NSTouchBarDelegate,NSWind
     var active=true
     var statusLabel:NSTextField?
     var leadLabel:NSTextField?
+    var leadSlider:NSSlider?
     var sizeLabel:NSTextField?
     var fontButton:NSPopUpButton?
     var lastStatus = ""
@@ -75,8 +76,13 @@ final class AppDelegate:NSObject,NSApplicationDelegate,NSTouchBarDelegate,NSWind
         if settings?.isVisible == true { preview.refresh() }
         if overlay?.isVisible == true { overlayView.refresh() }
         let p=model.playback
-        let newStatus="\(p?.title ?? "等待播放") · \(p?.artist ?? "QQ 音乐")\n\(model.source) · \(model.isQQ && model.fresh ? "已连接 QQ 音乐" : "等待 QQ 音乐")\nTouch Bar 接口：\(DFR.available ? "已加载" : "不可用")"
-        if newStatus != lastStatus { lastStatus=newStatus; statusLabel?.stringValue=newStatus }
+        let timingStatus=model.timingStatus
+        let timing=timingStatus.isEmpty || model.source.contains(timingStatus) ? "" : " · "+timingStatus
+        let newStatus="\(p?.title ?? "等待播放") · \(p?.artist ?? "QQ 音乐")\n\(model.source)\(timing) · \(model.isQQ && model.fresh ? "已连接 QQ 音乐" : "等待 QQ 音乐")\nTouch Bar 接口：\(DFR.available ? "已加载" : "不可用")"
+        if newStatus != lastStatus {
+            lastStatus=newStatus; statusLabel?.stringValue=newStatus
+            leadSlider?.doubleValue=model.lead; leadLabel?.stringValue=leadDescription()
+        }
     }
     @objc func reloadLyrics() { model.source="正在查找歌词…"; model.lookup() }
     @objc func importLRC() {
@@ -137,23 +143,24 @@ final class AppDelegate:NSObject,NSApplicationDelegate,NSTouchBarDelegate,NSWind
         let centerButton=NSButton(title:"重置到中点",target:self,action:#selector(resetPosition))
         let positionRow=NSStackView(views:[position,positionLabel!,centerButton]); positionRow.spacing=12
         stack.addArrangedSubview(row("水平位置",positionRow))
-        let lead=NSSlider(value:prefs.lead,minValue:-5,maxValue:5,target:self,action:#selector(leadChanged(_:))); lead.widthAnchor.constraint(equalToConstant:270).isActive=true
-        leadLabel=label(String(format:"%+.1f 秒",prefs.lead))
+        let lead=NSSlider(value:model.lead,minValue:-5,maxValue:5,target:self,action:#selector(leadChanged(_:))); lead.widthAnchor.constraint(equalToConstant:270).isActive=true; leadSlider=lead
+        leadLabel=label(leadDescription())
         let leadRow=NSStackView(views:[lead,leadLabel!]); leadRow.spacing=12
         stack.addArrangedSubview(row("歌词时间",leadRow))
-        stack.addArrangedSubview(label("正值让歌词提前，负值让歌词延后；保留你原来的 +1.7 秒。",size:11))
+        stack.addArrangedSubview(label("正值提前，负值延后；逐字与逐句分别保存偏移。逐字默认 0 秒，逐句保留原来的校准。",size:11))
         let controls=NSButton(checkboxWithTitle:"显示进度和播放按钮",target:self,action:#selector(controlsChanged(_:))); controls.state=prefs.controls ? .on:.off
         let scroll=NSButton(checkboxWithTitle:"长句平滑滚动",target:self,action:#selector(scrollChanged(_:))); scroll.state=prefs.scroll ? .on:.off
         let options=NSStackView(views:[controls,scroll]); options.spacing=20; stack.addArrangedSubview(options)
-        let progress=NSButton(checkboxWithTitle:"整句进度染色（使用强调色）",target:self,action:#selector(progressChanged(_:))); progress.state=prefs.lineProgress ? .on:.off
+        let progress=NSButton(checkboxWithTitle:"逐字进度染色",target:self,action:#selector(progressChanged(_:))); progress.state=prefs.lineProgress ? .on:.off
         let slide=NSButton(checkboxWithTitle:"切句向上滑动",target:self,action:#selector(slideChanged(_:))); slide.state=prefs.slideLyrics ? .on:.off
-        let effects=NSStackView(views:[progress,slide]); effects.spacing=20; stack.addArrangedSubview(effects)
+        let estimate=NSButton(checkboxWithTitle:"无逐字时间时使用估算",target:self,action:#selector(estimateChanged(_:))); estimate.state=prefs.estimateProgress ? .on:.off
+        let effects=NSStackView(views:[progress,slide,estimate]); effects.spacing=20; stack.addArrangedSubview(effects)
         let fillDuration=NSSlider(value:prefs.maxFillDuration,minValue:2,maxValue:15,target:self,action:#selector(fillDurationChanged(_:)))
         fillDuration.widthAnchor.constraint(equalToConstant:240).isActive=true; fillDuration.isContinuous=true
         fillDurationLabel=label(String(format:"最多 %.1f 秒",prefs.maxFillDuration))
         let fillRow=NSStackView(views:[fillDuration,fillDurationLabel!]); fillRow.spacing=12
-        stack.addArrangedSubview(row("染色时长",fillRow))
-        stack.addArrangedSubview(label("长间隔先完成染色再保持；这是估算，偏慢可缩短，长音可延长。",size:11))
+        stack.addArrangedSubview(row("估算上限",fillRow))
+        stack.addArrangedSubview(label("逐字歌词按真实字词时间染色；仅估算模式使用此上限。没有逐字时间时默认显示纯色。",size:11))
         let desktop=NSButton(checkboxWithTitle:"同时显示桌面悬浮歌词（鼠标可穿透）",target:self,action:#selector(desktopChanged(_:))); desktop.state=prefs.desktop ? .on:.off
         stack.addArrangedSubview(desktop)
         let login=NSButton(checkboxWithTitle:"登录时启动",target:self,action:#selector(loginChanged(_:))); login.state=SMAppService.mainApp.status == .enabled ? .on:.off
@@ -178,7 +185,12 @@ final class AppDelegate:NSObject,NSApplicationDelegate,NSTouchBarDelegate,NSWind
     @objc func resetPosition() {
         prefs.horizontalOffset=0; positionSlider?.doubleValue=0; positionLabel?.stringValue=positionDescription(); refresh()
     }
-    @objc func leadChanged(_ s:NSSlider) { prefs.lead=(s.doubleValue*10).rounded()/10; leadLabel?.stringValue=String(format:"%+.1f 秒",prefs.lead); refresh() }
+    func leadDescription() -> String { String(format:"%@ %+.1f 秒",model.hasWordTiming ? "逐字":"逐句",model.lead) }
+    @objc func leadChanged(_ s:NSSlider) {
+        let value=(s.doubleValue*10).rounded()/10
+        if model.hasWordTiming { prefs.wordLead=value } else { prefs.lead=value }
+        leadLabel?.stringValue=leadDescription(); refresh()
+    }
     @objc func controlsChanged(_ s:NSButton) { prefs.controls=s.state == .on; refresh() }
     @objc func scrollChanged(_ s:NSButton) { prefs.scroll=s.state == .on; refresh() }
     @objc func fillDurationChanged(_ s:NSSlider) {
@@ -186,6 +198,7 @@ final class AppDelegate:NSObject,NSApplicationDelegate,NSTouchBarDelegate,NSWind
         fillDurationLabel?.stringValue=String(format:"最多 %.1f 秒",prefs.maxFillDuration); refresh()
     }
     @objc func progressChanged(_ s:NSButton) { prefs.lineProgress=s.state == .on; refresh() }
+    @objc func estimateChanged(_ s:NSButton) { prefs.estimateProgress=s.state == .on; refresh() }
     @objc func slideChanged(_ s:NSButton) { prefs.slideLyrics=s.state == .on; refresh() }
     @objc func desktopChanged(_ s:NSButton) { prefs.desktop=s.state == .on; updateOverlay() }
     @objc func loginChanged(_ s:NSButton) {
